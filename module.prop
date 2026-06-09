@@ -1,0 +1,7 @@
+id=bootmask
+name=Boot Integrity Mask
+version=v3.6
+versionCode=360
+author=ExchNow (by Lolokeksu)
+description=Скрывает модификации загрузочных разделов (boot, vbmeta, super и др.) от проверок через by-name. Адаптивный watchdog, защита от bootloop. Magisk 27+/KernelSU/APatch.
+minMagisk=27000

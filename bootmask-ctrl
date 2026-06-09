@@ -1,0 +1,1264 @@
+#!/system/bin/sh
+# ========================================================
+# Boot Integrity Mask v3.6 – Центр управления
+# ========================================================
+[ "$(id -u)" -ne 0 ] && echo "Требуются права root" && exit 1
+
+MODDIR="/data/adb/modules/bootmask"
+STOCK_PLAIN="$MODDIR/common/stock_boot.img"
+DISABLE_FLAG="$MODDIR/disable"
+COMPAT_FLAG="$MODDIR/common/compat_mode"
+FREEZE_FLAG="$MODDIR/.frozen"
+STEALTH_FLAG="$MODDIR/.stealth"
+MONITOR_FLAG="$MODDIR/.monitor"
+WATCHDOG_PIDFILE="$MODDIR/.watchdog_pid"
+HOOKS_DIR="$MODDIR/common/hooks"
+CTRL_LOG="$MODDIR/ctrl.log"
+RESTORE_COUNT_FILE="$MODDIR/.restore_count"
+LOOP_ERROR_FILE="$MODDIR/.loop_error_count"
+
+# Типы дополнительных подменяемых разделов (помимо основного TARGET_PART)
+EXTRA_PARTS="vbmeta vendor_boot recovery dtbo"
+
+if [ -t 1 ]; then
+  GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
+  NC='\033[0m'
+else
+  GREEN=''; RED=''; YELLOW=''; CYAN=''; BLUE=''; MAGENTA=''; NC=''
+fi
+
+msg() { echo -e "$1"; }
+log_action() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CTRL_LOG"; }
+
+# Чтение и валидация интервала watchdog (возвращает число или 120 по умолчанию)
+get_watchdog_interval() {
+  local val
+  val=$(head -1 "$MODDIR/common/watchdog.conf" 2>/dev/null | tr -d ' \t\r\n')
+  if [ -n "$val" ] && [ "$val" -ge 10 ] 2>/dev/null; then
+    echo "$val"
+  else
+    echo "120"
+  fi
+}
+
+safe_run() {
+  local timeout_sec="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout_sec" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+check_deps() {
+  local missing=""
+  for util in losetup blockdev dd stat find readlink md5sum sha256sum; do
+    command -v "$util" >/dev/null 2>&1 || missing="$missing $util"
+  done
+  [ -n "$missing" ] && msg "${RED}[!] Отсутствуют утилиты:${missing}${NC}\n   Некоторые функции меню будут недоступны."
+}
+
+CACHED_TEMP="N/A"; CACHED_BATTERY="N/A"; CACHE_TIME=0; CACHE_TTL=2
+
+update_cache() {
+  local now=$(date +%s)
+  if [ $((now - CACHE_TIME)) -ge $CACHE_TTL ]; then
+    [ -f /sys/class/thermal/thermal_zone0/temp ] && CACHED_TEMP=$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null) / 1000 ))"°C"
+    [ -f /sys/class/power_supply/battery/capacity ] && CACHED_BATTERY="$(cat /sys/class/power_supply/battery/capacity)%"
+    CACHE_TIME=$now
+  fi
+}
+
+spinner() {
+  local pid=$1
+  local chars="/ - \\ |"
+  while kill -0 $pid 2>/dev/null; do
+    for c in $chars; do
+      printf "\r[%c] " "$c"
+      sleep 0.1
+    done
+  done
+  printf "\r   \r"
+}
+
+get_active_loop() {
+  case "$1" in
+    boot) cat "$MODDIR/.active_loop" 2>/dev/null ;;
+    vbmeta) cat "$MODDIR/.active_vbmeta_loop" 2>/dev/null ;;
+    vendor_boot) cat "$MODDIR/.active_vendor_boot_loop" 2>/dev/null ;;
+    recovery) cat "$MODDIR/.active_recovery_loop" 2>/dev/null ;;
+    dtbo) cat "$MODDIR/.active_dtbo_loop" 2>/dev/null ;;
+  esac
+}
+
+get_term_width() {
+  local w
+  if command -v tput >/dev/null 2>&1; then
+    w=$(tput cols 2>/dev/null)
+  fi
+  [ -z "$w" ] && w=$(stty size 2>/dev/null | awk '{print $2}')
+  [ -z "$w" ] && w=80
+  echo $w
+}
+
+show_dashboard() {
+  update_cache
+  local target=$(cat "$MODDIR/.target_part" 2>/dev/null || echo "boot")
+  local loop=$(get_active_loop boot)
+  local slot=$(getprop ro.boot.slot_suffix)
+  local interval=$(get_watchdog_interval)
+  local last_check=$(cat "$MODDIR/.last_check" 2>/dev/null)
+  local now=$(date +%s)
+  local ago=""
+  [ -n "$last_check" ] && ago="$(( now - last_check )) сек. назад"
+
+  local term_width=$(get_term_width)
+  if [ "$term_width" -lt 60 ]; then
+    msg "=== BOOT INTEGRITY MASK v3.5 ==="
+    msg " Статус: $([ -f "$DISABLE_FLAG" ] && echo -e "${RED}ОТКЛЮЧЁН${NC}" || echo -e "${GREEN}АКТИВЕН${NC}")"
+    msg " Цель: $target  Loop: ${loop:-нет}"
+    msg " Watchdog: ${interval}с  Stealth: $([ -f "$STEALTH_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    msg " Compat: $([ -f "$COMPAT_FLAG" ] && echo ВКЛ || echo ВЫКЛ)  Freeze: $([ -f "$FREEZE_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    msg " Restores: $(cat "$RESTORE_COUNT_FILE")  Errors: $(cat "$LOOP_ERROR_FILE")"
+    msg " Temp: $CACHED_TEMP  Bat: $CACHED_BATTERY"
+    if [ -f "$DISABLE_FLAG" ]; then
+      msg "${RED}Рекомендации: модуль отключён.${NC}"
+    elif [ -z "$loop" ]; then
+      msg "${RED}Рекомендации: loop не найден.${NC}"
+    else
+      msg "${GREEN}Рекомендации: всё работает штатно.${NC}"
+    fi
+  else
+    clear 2>/dev/null || printf "\033[2J\033[H"
+    msg "================================================"
+    msg "         BOOT INTEGRITY MASK v3.5"
+    msg "================================================"
+    msg "  Модуль:        $([ -f "$DISABLE_FLAG" ] && echo -e "${RED}ОТКЛЮЧЁН${NC}" || echo -e "${GREEN}АКТИВЕН${NC}")"
+    msg "  Целевой раздел: $target"
+    msg "  Loop-устройство: ${loop:-нет}"
+    msg "  Слот:          ${slot:-нет}"
+    msg ""
+    msg "  Watchdog:      $([ -f "$MONITOR_FLAG" ] && echo -e "${YELLOW}Мониторинг${NC}" || echo -e "${GREEN}Активен${NC}")"
+    msg "    Интервал:    ${interval}с (адаптивный)"
+    msg "    Режим:       $([ -f "$MONITOR_FLAG" ] && echo "Только наблюдение" || echo "Восстановление ссылок")"
+    msg "    Последняя проверка: ${ago:-нет данных}"
+    msg "    Восстановлений: $(cat "$RESTORE_COUNT_FILE")  Ошибок loop: $(cat "$LOOP_ERROR_FILE")"
+    msg ""
+    msg "  Stealth:       $([ -f "$STEALTH_FLAG" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ")"
+    msg "  Monitor:       $([ -f "$MONITOR_FLAG" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ")"
+    msg "  Compat mode:   $([ -f "$COMPAT_FLAG" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ")"
+    msg "  Freeze:        $([ -f "$FREEZE_FLAG" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ")"
+    msg ""
+    msg "  Температура:   $CACHED_TEMP"
+    msg "  Батарея:       $CACHED_BATTERY"
+    msg "================================================"
+    if [ -f "$DISABLE_FLAG" ]; then
+      msg "  ${RED}Рекомендации: Модуль отключён. Удалите disable и перезагрузитесь.${NC}"
+    elif [ -z "$loop" ]; then
+      msg "  ${RED}Рекомендации: Loop-устройство не найдено. Выполните restore и перезагрузитесь.${NC}"
+    else
+      msg "  ${GREEN}Рекомендации: Нет. Всё работает штатно.${NC}"
+    fi
+    msg "================================================"
+  fi
+}
+
+status_line() {
+  local module_status="АКТИВЕН"
+  [ -f "$DISABLE_FLAG" ] && module_status="${RED}ОТКЛЮЧЁН${NC}"
+  local interval=$(get_watchdog_interval)
+  local stealth="ВЫКЛ"; [ -f "$STEALTH_FLAG" ] && stealth="${YELLOW}ВКЛ${NC}"
+  local compat="ВЫКЛ"; [ -f "$COMPAT_FLAG" ] && compat="${YELLOW}ВКЛ${NC}"
+  msg "Модуль: ${module_status} | Watchdog: ${interval}с | Stealth: ${stealth} | Compat: ${compat}"
+}
+
+show_status_json() {
+  local target=$(cat "$MODDIR/.target_part" 2>/dev/null || echo "boot")
+  local loop=$(get_active_loop boot)
+  local slot=$(getprop ro.boot.slot_suffix)
+  local disabled="false"; [ -f "$DISABLE_FLAG" ] && disabled="true"
+  local stealth="false"; [ -f "$STEALTH_FLAG" ] && stealth="true"
+  local monitor="false"; [ -f "$MONITOR_FLAG" ] && monitor="true"
+  local compat="false"; [ -f "$COMPAT_FLAG" ] && compat="true"
+  local freeze="false"; [ -f "$FREEZE_FLAG" ] && freeze="true"
+  local interval=$(get_watchdog_interval)
+  local last_check=$(cat "$MODDIR/.last_check" 2>/dev/null)
+  local temp="null"; [ -f /sys/class/thermal/thermal_zone0/temp ] && temp=$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null) / 1000 ))
+  local battery="null"; [ -f /sys/class/power_supply/battery/capacity ] && battery=$(cat /sys/class/power_supply/battery/capacity)
+  local restore_count=$(cat "$RESTORE_COUNT_FILE" 2>/dev/null)
+  local loop_errors=$(cat "$LOOP_ERROR_FILE" 2>/dev/null)
+
+  echo "{"
+  echo "  \"module\": \"${disabled}\","
+  echo "  \"disabled\": ${disabled},"
+  echo "  \"target\": \"${target}\","
+  echo "  \"loop\": \"${loop:-null}\","
+  echo "  \"slot\": \"${slot:-null}\","
+  echo "  \"watchdog\": {"
+  echo "    \"interval\": ${interval},"
+  echo "    \"last_check\": \"${last_check:-null}\","
+  echo "    \"monitor_mode\": ${monitor},"
+  echo "    \"restore_count\": ${restore_count},"
+  echo "    \"loop_errors\": ${loop_errors}"
+  echo "  },"
+  echo "  \"stealth\": ${stealth},"
+  echo "  \"compat_mode\": ${compat},"
+  echo "  \"frozen\": ${freeze},"
+  echo "  \"temperature\": ${temp},"
+  echo "  \"battery\": ${battery}"
+  echo "}"
+}
+
+run_event_hooks() {
+  local event="$1"
+  local target="$2"
+  local loop="$3"
+  local link="$4"
+  local hook_dir="$HOOKS_DIR/$event"
+  [ -d "$hook_dir" ] || return 0
+  for script in "$hook_dir"/*; do
+    [ -x "$script" ] || continue
+    msg "→ Запуск хука: $script (событие: $event)"
+    (
+      HOOK_EVENT="$event" \
+      HOOK_TARGET="$target" \
+      HOOK_LOOP="$loop" \
+      HOOK_LINK="$link" \
+      HOOK_TIMESTAMP=$(date +%s) \
+      timeout 30 "$script" 2>&1
+    ) &
+    local pid=$!
+    spinner $pid
+    wait $pid
+    local rc=$?
+    [ $rc -ne 0 ] && msg "${RED}Хук завершился с кодом $rc${NC}"
+  done
+}
+
+show_hooks() {
+  msg "${GREEN}=== Установленные хуки ===${NC}"
+  for event_dir in "$HOOKS_DIR/"*/; do
+    [ -d "$event_dir" ] || continue
+    local event=$(basename "$event_dir")
+    msg "${CYAN}[$event]${NC}"
+    for script in "$event_dir"/*; do
+      [ -x "$script" ] && msg "  - $(basename "$script")"
+    done
+  done
+}
+
+ALLOWED_HOOK_EVENTS="pre-activate post-activate on-link-broken on-link-restored on-ota-detected pre-deactivate post-deactivate"
+run_hooks_cmd() {
+  local event="$1"
+  local valid=0
+  for e in $ALLOWED_HOOK_EVENTS; do
+    [ "$e" = "$event" ] && valid=1
+  done
+  if [ $valid -eq 0 ]; then
+    msg "${RED}Недопустимое событие: $event${NC}"
+    msg "Допустимые события: $ALLOWED_HOOK_EVENTS"
+    return 1
+  fi
+  run_event_hooks "$event" "$(cat "$MODDIR/.target_part" 2>/dev/null)" "$(get_active_loop boot)" ""
+}
+
+enable_module() {
+  if [ -f "$DISABLE_FLAG" ]; then
+    rm "$DISABLE_FLAG"
+    msg "${GREEN}Модуль включён. Перезагрузите устройство.${NC}"
+    log_action "enable"
+  else
+    msg "${YELLOW}Модуль уже включён.${NC}"
+  fi
+}
+
+disable_module() {
+  touch "$DISABLE_FLAG"
+  run_event_hooks "pre-deactivate" "$(cat "$MODDIR/.target_part" 2>/dev/null)" "$(get_active_loop boot)" ""
+  msg "${YELLOW}Модуль отключён. После перезагрузки будет неактивен.${NC}"
+  run_event_hooks "post-deactivate" "$(cat "$MODDIR/.target_part" 2>/dev/null)" "$(get_active_loop boot)" ""
+  log_action "disable"
+}
+
+restore_module() {
+  if [ "$1" != "force" ]; then
+    printf "Вы уверены, что хотите убрать подмену и отключить модуль? [y/N] "
+    read confirm
+    case "$confirm" in
+      [Yy]|[Yy][Ee][Ss]) ;;
+      *) msg "Отмена."; return 1 ;;
+    esac
+  fi
+  local target=$(cat "$MODDIR/.target_part" 2>/dev/null)
+  local loop=$(get_active_loop boot)
+  run_event_hooks "pre-deactivate" "$target" "$loop" ""
+  msg "${GREEN}Выполняется восстановление...${NC}"
+  ( restore_actions ) &
+  local pid=$!
+  spinner $pid
+  wait $pid
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    msg "${YELLOW}Исходные ссылки восстановлены. Модуль отключён. Рекомендуется перезагрузка.${NC}"
+    run_event_hooks "post-deactivate" "$target" "$loop" ""
+    log_action "restore"
+  else
+    msg "${RED}Ошибка при восстановлении.${NC}"
+  fi
+}
+
+restore_actions() {
+  if [ -f "$MODDIR/.byname_dir" ]; then
+    BYNAME_DIR=$(cat "$MODDIR/.byname_dir")
+    if grep -q " $BYNAME_DIR " /proc/mounts 2>/dev/null; then
+      umount "$BYNAME_DIR" 2>/dev/null
+    fi
+  fi
+  for type in boot $EXTRA_PARTS; do
+    local loop=$(get_active_loop "$type")
+    if [ -n "$loop" ] && [ -b "$loop" ]; then
+      safe_run 5 losetup -d "$loop" 2>/dev/null
+    fi
+  done
+  rm -f "$MODDIR/.stock_checksum" "$MODDIR/.active_loop" "$MODDIR/.byname_dir" \
+        "$MODDIR/.target_part" "$MODDIR/.vbmeta_enabled" "$MODDIR/.active_vbmeta_loop" \
+        "$MODDIR/.vendor_boot_enabled" "$MODDIR/.active_vendor_boot_loop" \
+        "$MODDIR/.recovery_enabled" "$MODDIR/.active_recovery_loop" \
+        "$MODDIR/.dtbo_enabled" "$MODDIR/.active_dtbo_loop" \
+        "$MODDIR/.last_check" "$MODDIR/.stock_size" "$MODDIR/.backing_file" \
+        "$FREEZE_FLAG" "$STEALTH_FLAG" "$MONITOR_FLAG" "$WATCHDOG_PIDFILE" \
+        "$RESTORE_COUNT_FILE" "$LOOP_ERROR_FILE"
+  touch "$DISABLE_FLAG"
+}
+
+freeze_module() {
+  if [ -f "$FREEZE_FLAG" ]; then
+    msg "${YELLOW}Уже заморожен.${NC}"
+  else
+    local target=$(cat "$MODDIR/.target_part" 2>/dev/null)
+    local loop=$(get_active_loop boot)
+    run_event_hooks "pre-deactivate" "$target" "$loop" ""
+    touch "$FREEZE_FLAG"
+    if [ -f "$MODDIR/.byname_dir" ]; then
+      local byname=$(cat "$MODDIR/.byname_dir")
+      if grep -q " $byname " /proc/mounts 2>/dev/null; then
+        umount "$byname" 2>/dev/null
+      fi
+    fi
+    msg "${YELLOW}Модуль заморожен. Подмена отключена до разморозки.${NC}"
+    run_event_hooks "post-deactivate" "$target" "$loop" ""
+    log_action "freeze"
+  fi
+}
+
+thaw_module() {
+  if [ -f "$FREEZE_FLAG" ]; then
+    rm -f "$FREEZE_FLAG"
+    msg "${GREEN}Модуль разморожен. Подмена восстановлена.${NC}"
+    /data/adb/modules/bootmask/post-fs-data.sh 2>/dev/null &
+    log_action "thaw"
+  else
+    msg "${YELLOW}Не был заморожен.${NC}"
+  fi
+}
+
+analyze() {
+  echo -e "${GREEN}=== Анализатор состояния ===${NC}\n"
+  local issues=0
+  if [ -f "$DISABLE_FLAG" ]; then
+    echo -e "${RED}[!] Модуль отключён.${NC}"
+    issues=$((issues+1))
+  else
+    echo -e "${GREEN}[✓] Модуль включён.${NC}"
+  fi
+  if [ ! -f "$STOCK_PLAIN" ]; then
+    echo -e "${RED}[!] Стоковый образ не найден.${NC}"
+    issues=$((issues+1))
+  else
+    echo -e "${GREEN}[✓] Стоковый образ найден.${NC}"
+  fi
+  local loop=$(get_active_loop boot)
+  if [ -z "$loop" ] || [ ! -b "$loop" ]; then
+    echo -e "${RED}[!] Loop-устройство не активно.${NC}"
+    issues=$((issues+1))
+  else
+    echo -e "${GREEN}[✓] Loop-устройство активно: $loop${NC}"
+  fi
+  if [ -f "$STOCK_PLAIN" ] && [ -b "$loop" ]; then
+    local stock_size=$(stat -c%s "$STOCK_PLAIN")
+    local loop_size=$(blockdev --getsize64 "$loop" 2>/dev/null)
+    if [ -n "$loop_size" ] && [ "$stock_size" != "$loop_size" ]; then
+      echo -e "${RED}[!] Размеры не совпадают.${NC}"
+      issues=$((issues+1))
+    else
+      echo -e "${GREEN}[✓] Размеры совпадают.${NC}"
+    fi
+  fi
+  if [ -f "$COMPAT_FLAG" ]; then
+    echo -e "${YELLOW}[i] Compat mode активен.${NC}"
+  else
+    if [ -f "$MODDIR/.byname_dir" ]; then
+      local byname=$(cat "$MODDIR/.byname_dir")
+      if grep -q " $byname " /proc/mounts 2>/dev/null; then
+        echo -e "${GREEN}[✓] tmpfs смонтирована.${NC}"
+      else
+        echo -e "${RED}[!] tmpfs не смонтирована.${NC}"
+        issues=$((issues+1))
+      fi
+    fi
+  fi
+  [ -f "$FREEZE_FLAG" ] && echo -e "${YELLOW}[i] Модуль заморожен.${NC}"
+  [ -f "$STEALTH_FLAG" ] && echo -e "${YELLOW}[i] Stealth активен.${NC}"
+  [ -f "$MONITOR_FLAG" ] && echo -e "${YELLOW}[i] Monitor активен.${NC}"
+
+  local restore_count=$(cat "$RESTORE_COUNT_FILE" 2>/dev/null)
+  local loop_errors=$(cat "$LOOP_ERROR_FILE" 2>/dev/null)
+  echo -e "${GREEN}[i] Статистика watchdog:${NC}"
+  echo "    Восстановлений ссылок: $restore_count"
+  echo "    Ошибок loop: $loop_errors"
+
+  if [ -f "$MODDIR/bootmask.log" ]; then
+    local last_restore=$(grep "restored" "$MODDIR/bootmask.log" 2>/dev/null | tail -1)
+    [ -n "$last_restore" ] && echo "    Последнее восстановление: $last_restore"
+    local last_error=$(grep "error\|FAILED" "$MODDIR/bootmask.log" 2>/dev/null | tail -1)
+    [ -n "$last_error" ] && echo "    Последняя ошибка: $last_error"
+  fi
+
+  # Проверка соответствия образа текущей прошивке
+  local fp_file="$MODDIR/.stock_fingerprint"
+  if [ -f "$fp_file" ]; then
+    local fp_saved=$(cat "$fp_file" 2>/dev/null | tr -d ' \t\r\n')
+    local fp_current=$(getprop ro.build.fingerprint 2>/dev/null | tr -d ' \t\r\n')
+    if [ -n "$fp_saved" ] && [ -n "$fp_current" ]; then
+      if [ "$fp_saved" = "$fp_current" ]; then
+        echo -e "${GREEN}[✓] stock_boot.img соответствует текущей прошивке.${NC}"
+      else
+        echo -e "${RED}[!] stock_boot.img от другой версии прошивки!${NC}"
+        echo "    Установлен при: $fp_saved"
+        echo "    Текущий:        $fp_current"
+        echo "    Замените stock_boot.img и переустановите модуль."
+        issues=$((issues+1))
+      fi
+    fi
+  fi
+
+  echo ""
+  if [ $issues -eq 0 ]; then
+    echo -e "${GREEN}=== Все проверки пройдены. ===${NC}"
+  else
+    echo -e "${RED}=== Обнаружено проблем: $issues ===${NC}"
+  fi
+}
+
+analyze_json() {
+  local target=$(cat "$MODDIR/.target_part" 2>/dev/null || echo "boot")
+  local loop=$(get_active_loop boot)
+  local disabled="false"; [ -f "$DISABLE_FLAG" ] && disabled="true"
+  local compat="false"; [ -f "$COMPAT_FLAG" ] && compat="true"
+  local tmpfs_mounted="false"
+  if [ -f "$MODDIR/.byname_dir" ]; then
+    local byname=$(cat "$MODDIR/.byname_dir")
+    grep -q " $byname " /proc/mounts 2>/dev/null && tmpfs_mounted="true"
+  fi
+  local restore_count=$(cat "$RESTORE_COUNT_FILE" 2>/dev/null)
+  local loop_errors=$(cat "$LOOP_ERROR_FILE" 2>/dev/null)
+
+  echo "{"
+  echo "  \"module\": \"${disabled}\","
+  echo "  \"disabled\": ${disabled},"
+  echo "  \"target\": \"${target}\","
+  echo "  \"loop\": \"${loop:-null}\","
+  echo "  \"compat_mode\": ${compat},"
+  echo "  \"tmpfs_mounted\": ${tmpfs_mounted},"
+  echo "  \"restore_count\": ${restore_count},"
+  echo "  \"loop_errors\": ${loop_errors}"
+  echo "}"
+}
+
+generate_report() {
+  local report_dir="/sdcard/BootMask/reports"
+  mkdir -p "$report_dir"
+  local report_file="$report_dir/bootmask_report_$(date +%Y%m%d_%H%M%S).txt"
+
+  # Временно обнуляем цвета, чтобы отчёт не содержал ANSI-последовательностей
+  # (надёжнее, чем чистка через sed, и не зависит от реализации sed на устройстве)
+  local _G="$GREEN" _R="$RED" _Y="$YELLOW" _C="$CYAN" _B="$BLUE" _M="$MAGENTA" _N="$NC"
+  GREEN=''; RED=''; YELLOW=''; CYAN=''; BLUE=''; MAGENTA=''; NC=''
+
+  {
+    echo "=== Boot Integrity Mask Report ==="
+    echo "Дата: $(date)"
+    echo ""
+
+    # Компактный статус (без clear/escape — show_dashboard в отчёт не зовём)
+    echo "=== Статус модуля ==="
+    echo "Состояние: $([ -f "$DISABLE_FLAG" ] && echo ОТКЛЮЧЁН || echo АКТИВЕН)"
+    echo "Целевой раздел: $(cat "$MODDIR/.target_part" 2>/dev/null || echo boot)"
+    echo "Loop-устройство: $(get_active_loop boot)"
+    echo "Слот: $(getprop ro.boot.slot_suffix)"
+    echo "Watchdog интервал: $(get_watchdog_interval)с"
+    echo "Stealth: $([ -f "$STEALTH_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    echo "Monitor: $([ -f "$MONITOR_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    echo "Compat mode: $([ -f "$COMPAT_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    echo "Freeze: $([ -f "$FREEZE_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+    echo ""
+
+    # diag/hooks через tr -d '\033' — удаляем любые случайные ESC-символы
+    show_diag | tr -d '\033'
+    echo ""
+    echo "=== Статистика watchdog ==="
+    echo "Восстановлений ссылок: $(cat "$RESTORE_COUNT_FILE")"
+    echo "Ошибок loop: $(cat "$LOOP_ERROR_FILE")"
+    echo ""
+    echo "=== Список хуков ==="
+    show_hooks | tr -d '\033'
+    echo ""
+    echo "=== Состояние sysfs ==="
+    [ -f /sys/class/power_supply/battery/capacity ] && echo "Батарея: $(cat /sys/class/power_supply/battery/capacity)%"
+    [ -f /sys/class/thermal/thermal_zone0/temp ] && echo "Температура: $(( $(cat /sys/class/thermal/thermal_zone0/temp) / 1000 ))°C"
+    [ -f /sys/devices/system/cpu/cpufreq/policy0/scaling_governor ] && echo "CPU governor: $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor)"
+    echo ""
+
+    # Журнал событий: dmesg (если доступен) + bootmask.log
+    echo "=== Журнал событий ==="
+    _dmesg_out=$(dmesg 2>/dev/null | grep BootMask | uniq)
+    if [ -n "$_dmesg_out" ]; then
+      echo "[ Логи ядра (dmesg) ]"
+      echo "$_dmesg_out"
+      echo ""
+    else
+      echo "[ Логи ядра (dmesg) недоступны — ограничение dmesg_restrict/SELinux или stealth-режим ]"
+      echo ""
+    fi
+    if [ -f "$MODDIR/bootmask.log" ]; then
+      echo "[ Журнал модуля (bootmask.log) ]"
+      cat "$MODDIR/bootmask.log"
+    else
+      echo "[ Журнал модуля (bootmask.log) пуст или отсутствует ]"
+    fi
+  } > "$report_file"
+
+  # Восстанавливаем цвета
+  GREEN="$_G"; RED="$_R"; YELLOW="$_Y"; CYAN="$_C"; BLUE="$_B"; MAGENTA="$_M"; NC="$_N"
+
+  msg "${GREEN}Отчёт сохранён: $report_file${NC}"
+  log_action "report"
+}
+
+diff_report() {
+  local report_dir="/sdcard/BootMask/reports"
+  if [ ! -d "$report_dir" ]; then
+    msg "${RED}Нет сохранённых отчётов.${NC}"
+    return 1
+  fi
+  local last=$(ls -1t "$report_dir"/bootmask_report_*.txt 2>/dev/null | head -1)
+  local prev=$(ls -1t "$report_dir"/bootmask_report_*.txt 2>/dev/null | head -2 | tail -1)
+  if [ -z "$last" ] || [ -z "$prev" ]; then
+    msg "${RED}Необходимо минимум два отчёта. Создайте их командой report.${NC}"
+    return 1
+  fi
+  if ! command -v diff >/dev/null 2>&1; then
+    msg "${RED}Утилита diff не найдена.${NC}"
+    return 1
+  fi
+  msg "${GREEN}Сравнение отчётов:${NC}"
+  msg "  Последний: $(basename "$last")"
+  msg "  Предыдущий: $(basename "$prev")"
+  msg ""
+  diff -u "$prev" "$last" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      ---*) msg "${BLUE}$line${NC}" ;;
+      +++*) msg "${BLUE}$line${NC}" ;;
+      -*) msg "${RED}$line${NC}" ;;
+      +*) msg "${GREEN}$line${NC}" ;;
+      @@*) msg "${CYAN}$line${NC}" ;;
+      *) msg "$line" ;;
+    esac
+  done
+  log_action "diff-report"
+}
+
+# ========================================================
+# Восстановленные функции центра управления v3.5
+# ========================================================
+
+# --------------------------------------------------------
+# Детекция root-менеджера (мягкая, без жёстких зависимостей)
+# --------------------------------------------------------
+detect_manager() {
+  if [ -d /data/adb/ap ] || [ -f /data/adb/apd ]; then
+    echo "APatch"
+  elif [ -f /data/adb/ksud ] || [ -d /data/adb/ksu ]; then
+    echo "KernelSU"
+  elif command -v magisk >/dev/null 2>&1 || [ -d /data/adb/magisk ]; then
+    echo "Magisk"
+  else
+    echo "unknown"
+  fi
+}
+
+# Потоковый хеш: определяем утилиту один раз, читаем источник ровно один раз
+hash_target() {
+  local src="$1"
+  [ -e "$src" ] || { echo ""; return 1; }
+  if command -v sha256sum >/dev/null 2>&1; then
+    dd if="$src" bs=1M 2>/dev/null | sha256sum | awk '{print $1}'
+  else
+    dd if="$src" bs=1M 2>/dev/null | md5sum | awk '{print $1}'
+  fi
+}
+
+# Список типов разделов, для которых есть активный loop
+active_types() {
+  local types=""
+  [ -n "$(get_active_loop boot)" ] && types="boot"
+  for t in $EXTRA_PARTS; do
+    [ -f "$MODDIR/.active_${t}_loop" ] && types="$types $t"
+  done
+  if [ -f "$MODDIR/.super_targets" ]; then
+    while IFS= read -r sp; do
+      [ -z "$sp" ] && continue
+      [ -f "$MODDIR/.active_${sp}_loop" ] && types="$types $sp"
+    done < "$MODDIR/.super_targets"
+  fi
+  echo "$types"
+}
+
+# Путь к стоковому образу по типу раздела
+stock_img_for() {
+  case "$1" in
+    boot) echo "$MODDIR/common/stock_boot.img" ;;
+    *)    echo "$MODDIR/common/stock_$1.img" ;;
+  esac
+}
+
+# Путь к активному loop по типу (boot — через get_active_loop, прочие — из файла)
+loop_for() {
+  case "$1" in
+    boot) get_active_loop boot ;;
+    *)    cat "$MODDIR/.active_${1}_loop" 2>/dev/null ;;
+  esac
+}
+
+# --------------------------------------------------------
+# check_integrity — сверка всех активных loop со стоковыми образами
+# --------------------------------------------------------
+check_integrity() {
+  msg "${GREEN}=== Проверка целостности ===${NC}\n"
+  local types=$(active_types)
+  if [ -z "$types" ]; then
+    msg "${RED}[!] Нет активных loop-устройств для проверки.${NC}"
+    return 1
+  fi
+  local fails=0 checked=0
+  for t in $types; do
+    local img=$(stock_img_for "$t")
+    local loop=$(loop_for "$t")
+    if [ -z "$loop" ] || [ ! -b "$loop" ]; then
+      msg "${YELLOW}[i] $t: loop не активен, пропуск.${NC}"
+      continue
+    fi
+    if [ ! -f "$img" ] || [ ! -s "$img" ]; then
+      msg "${YELLOW}[i] $t: стоковый образ отсутствует/пуст, пропуск.${NC}"
+      continue
+    fi
+    local sz_img=$(stat -c%s "$img" 2>/dev/null)
+    local sz_loop=$(blockdev --getsize64 "$loop" 2>/dev/null)
+    checked=$((checked + 1))
+    if [ -n "$sz_img" ] && [ -n "$sz_loop" ] && [ "$sz_img" != "$sz_loop" ]; then
+      msg "${RED}[!] $t: размеры не совпадают ($sz_img != $sz_loop).${NC}"
+      fails=$((fails + 1))
+      continue
+    fi
+
+    # Кэш хеша образа: если образ не изменился (mtime совпадает) — не читаем заново
+    local cache_file="$MODDIR/.integrity_cache_${t}"
+    local img_mtime=$(stat -c%Y "$img" 2>/dev/null)
+    local h_img=""
+    if [ -f "$cache_file" ]; then
+      local cached_mtime cached_hash
+      IFS=' ' read -r cached_mtime cached_hash < "$cache_file" 2>/dev/null
+      if [ "$cached_mtime" = "$img_mtime" ] && [ -n "$cached_hash" ]; then
+        h_img="$cached_hash"
+        msg "    $t: хеш образа из кэша (образ не менялся)."
+      fi
+    fi
+    if [ -z "$h_img" ]; then
+      msg "    $t: вычисление хеша образа..."
+      h_img=$(hash_target "$img")
+      [ -n "$h_img" ] && printf '%s %s\n' "$img_mtime" "$h_img" > "$cache_file"
+    fi
+
+    msg "    $t: вычисление хеша loop..."
+    local h_loop=$(hash_target "$loop")
+    if [ -n "$h_img" ] && [ "$h_img" = "$h_loop" ]; then
+      msg "${GREEN}[✓] $t: целостность подтверждена.${NC}"
+    else
+      msg "${RED}[!] $t: хеши не совпадают.${NC}"
+      msg "       образ: ${h_img:-?}"
+      msg "       loop:  ${h_loop:-?}"
+      fails=$((fails + 1))
+    fi
+  done
+  msg ""
+  if [ "$checked" -eq 0 ]; then
+    msg "${YELLOW}=== Нечего проверять. ===${NC}"
+  elif [ "$fails" -eq 0 ]; then
+    msg "${GREEN}=== Все проверки пройдены ($checked). ===${NC}"
+  else
+    msg "${RED}=== Несовпадений: $fails из $checked. ===${NC}"
+  fi
+  log_action "check-integrity (checked=$checked, fails=$fails)"
+}
+
+# --------------------------------------------------------
+# image_info — размер, хеш, magic для всех stock_*.img
+# --------------------------------------------------------
+image_info() {
+  msg "${GREEN}=== Информация об образах ===${NC}\n"
+  local found=0
+  for img in "$MODDIR/common/"stock_*.img; do
+    [ -f "$img" ] || continue
+    [ -s "$img" ] || { msg "${YELLOW}[i] $(basename "$img"): пустой файл, пропуск.${NC}"; continue; }
+    found=1
+    local name=$(basename "$img")
+    local size=$(stat -c%s "$img" 2>/dev/null)
+    local magic=$(dd if="$img" bs=8 count=1 2>/dev/null)
+    local hash=$(hash_target "$img")
+    msg "${CYAN}${name}${NC}"
+    msg "    Размер: ${size} байт"
+    msg "    Magic:  ${magic}"
+    msg "    SHA256: ${hash:-н/д}"
+    msg ""
+  done
+  [ "$found" -eq 0 ] && msg "${YELLOW}[i] Стоковые образы не найдены.${NC}"
+  log_action "image-info"
+}
+
+# --------------------------------------------------------
+# show_logs — объединённый вывод dmesg + bootmask.log
+# --------------------------------------------------------
+show_logs() {
+  local lines="$1"
+  case "$lines" in
+    ''|*[!0-9]*) lines=50 ;;
+  esac
+  msg "${GREEN}=== Логи BootMask (dmesg) ===${NC}"
+  if command -v dmesg >/dev/null 2>&1; then
+    local dout=$(dmesg 2>/dev/null | grep BootMask | tail -n "$lines")
+    [ -n "$dout" ] && echo "$dout" || msg "${YELLOW}[i] В dmesg нет записей BootMask.${NC}"
+  else
+    msg "${YELLOW}[i] dmesg недоступен.${NC}"
+  fi
+  msg ""
+  msg "${GREEN}=== Журнал bootmask.log (последние $lines) ===${NC}"
+  if [ -f "$MODDIR/bootmask.log" ]; then
+    tail -n "$lines" "$MODDIR/bootmask.log"
+  else
+    msg "${YELLOW}[i] Файл bootmask.log отсутствует (возможно, stealth или не было событий).${NC}"
+  fi
+  log_action "logs"
+}
+
+# --------------------------------------------------------
+# show_diag — расширенная текстовая диагностика
+# Вызывается также из generate_report.
+# --------------------------------------------------------
+show_diag() {
+  msg "${GREEN}=== Диагностика системы и модуля ===${NC}\n"
+
+  msg "${CYAN}Окружение${NC}"
+  msg "    Root-менеджер: $(detect_manager)"
+  if command -v getenforce >/dev/null 2>&1; then
+    msg "    SELinux: $(getenforce 2>/dev/null)"
+  elif [ -f /sys/fs/selinux/enforce ]; then
+    local e=$(cat /sys/fs/selinux/enforce 2>/dev/null)
+    msg "    SELinux: $([ "$e" = "1" ] && echo Enforcing || echo Permissive)"
+  fi
+  local slot=$(getprop ro.boot.slot_suffix)
+  msg "    Слот: ${slot:-нет (A-only)}"
+  msg "    Android: $(getprop ro.build.version.release 2>/dev/null)"
+  msg ""
+
+  msg "${CYAN}Утилиты${NC}"
+  local missing=""
+  for util in losetup blockdev dd stat find readlink md5sum sha256sum mount umount; do
+    if command -v "$util" >/dev/null 2>&1; then
+      msg "    [✓] $util"
+    else
+      msg "    ${RED}[!] $util — отсутствует${NC}"
+      missing="$missing $util"
+    fi
+  done
+  msg ""
+
+  msg "${CYAN}Состояние${NC}"
+  local loop=$(get_active_loop boot)
+  msg "    Целевой раздел: $(cat "$MODDIR/.target_part" 2>/dev/null || echo boot)"
+  if [ -n "$loop" ] && [ -b "$loop" ]; then
+    msg "    [✓] Основной loop: $loop"
+  else
+    msg "    ${RED}[!] Основной loop не активен${NC}"
+  fi
+
+  if [ -f "$MODDIR/.byname_dir" ]; then
+    local byname=$(cat "$MODDIR/.byname_dir")
+    if grep -q " $byname " /proc/mounts 2>/dev/null; then
+      msg "    [✓] tmpfs смонтирована на $byname"
+    else
+      if [ -f "$COMPAT_FLAG" ]; then
+        msg "    [i] tmpfs не используется (compat-режим)"
+      else
+        msg "    ${RED}[!] tmpfs не смонтирована${NC}"
+      fi
+    fi
+    msg "    by-name доступен: $([ -d "$byname" ] && echo да || echo ${RED}нет${NC})"
+  fi
+
+  local nloop=0
+  [ -n "$loop" ] && [ -b "$loop" ] && nloop=$((nloop + 1))
+  for t in $EXTRA_PARTS; do
+    local l=$(cat "$MODDIR/.active_${t}_loop" 2>/dev/null)
+    [ -n "$l" ] && [ -b "$l" ] && nloop=$((nloop + 1))
+  done
+
+  local free=$(df -k /data 2>/dev/null | tail -1 | awk '{print $4}')
+  [ -n "$free" ] && msg "    Свободно в /data: $((free / 1024)) MB"
+  msg ""
+
+  msg "${CYAN}Watchdog${NC}"
+  local wpid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+  if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+    msg "    [✓] Процесс активен (PID $wpid)"
+  else
+    msg "    ${YELLOW}[i] Процесс watchdog не обнаружен по PID${NC}"
+  fi
+  msg "    Stealth: $([ -f "$STEALTH_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+  msg "    Monitor: $([ -f "$MONITOR_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+  msg "    Freeze:  $([ -f "$FREEZE_FLAG" ] && echo ВКЛ || echo ВЫКЛ)"
+
+  [ -n "$missing" ] && msg "\n${RED}Внимание: отсутствуют утилиты:${missing}${NC}"
+  log_action "diag"
+}
+
+# --------------------------------------------------------
+# restart_watchdog — корректный перезапуск фонового watchdog
+# Защита от гонки: атомарная блокировка через mkdir.
+# --------------------------------------------------------
+restart_watchdog() {
+  local lockdir="$MODDIR/.restart_watchdog.lock"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    msg "${YELLOW}Перезапуск watchdog уже выполняется, пропуск.${NC}"
+    return 0
+  fi
+
+  msg "${GREEN}Перезапуск watchdog...${NC}"
+  local old_pid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    kill "$old_pid" 2>/dev/null
+    local n=0
+    while kill -0 "$old_pid" 2>/dev/null && [ "$n" -lt 10 ]; do
+      sleep 0.3; n=$((n + 1))
+    done
+    kill -0 "$old_pid" 2>/dev/null && kill -9 "$old_pid" 2>/dev/null
+    msg "    Старый процесс (PID $old_pid) остановлен."
+  else
+    msg "    Активный процесс не найден, выполняется чистый запуск."
+  fi
+  rm -f "$WATCHDOG_PIDFILE" 2>/dev/null
+
+  if [ -f "$DISABLE_FLAG" ] || [ -f "$FREEZE_FLAG" ]; then
+    msg "${YELLOW}Модуль отключён или заморожен — watchdog не запускается.${NC}"
+    log_action "restart-watchdog (skipped: disabled/frozen)"
+    rmdir "$lockdir" 2>/dev/null
+    return 0
+  fi
+
+  local svc="$MODDIR/service.sh"
+  [ -x "$svc" ] || { msg "${RED}service.sh не найден или не исполняемый.${NC}"; rmdir "$lockdir" 2>/dev/null; return 1; }
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$svc" >/dev/null 2>&1 &
+  elif command -v nohup >/dev/null 2>&1; then
+    nohup "$svc" >/dev/null 2>&1 &
+  else
+    "$svc" >/dev/null 2>&1 &
+  fi
+
+  local n=0 new_pid=""
+  while [ "$n" -lt 17 ]; do
+    sleep 0.3
+    new_pid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+    [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null && break
+    n=$((n + 1))
+  done
+
+  if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
+    msg "${GREEN}Watchdog перезапущен (PID $new_pid).${NC}"
+    log_action "restart-watchdog (new pid=$new_pid)"
+    rmdir "$lockdir" 2>/dev/null
+  else
+    msg "${RED}Не удалось подтвердить запуск watchdog.${NC}"
+    log_action "restart-watchdog (failed to confirm)"
+    rmdir "$lockdir" 2>/dev/null
+    return 1
+  fi
+}
+
+# --------------------------------------------------------
+# Обобщённый переключатель флаговых режимов
+# --------------------------------------------------------
+toggle_flag_mode() {
+  local name="$1"
+  local flag="$2"
+  local action="$3"
+  local apply_now="$4"
+  case "$action" in
+    on)
+      if [ -f "$flag" ]; then
+        msg "${YELLOW}${name}: уже включён.${NC}"
+      else
+        touch "$flag"
+        if [ "$apply_now" -eq 1 ]; then
+          msg "${GREEN}${name}: включён.${NC}"
+        else
+          msg "${GREEN}${name}: включён. Применится после перезагрузки.${NC}"
+        fi
+        log_action "${name}:on"
+      fi
+      ;;
+    off)
+      if [ -f "$flag" ]; then
+        rm -f "$flag"
+        if [ "$apply_now" -eq 1 ]; then
+          msg "${GREEN}${name}: выключен.${NC}"
+        else
+          msg "${GREEN}${name}: выключен. Применится после перезагрузки.${NC}"
+        fi
+        log_action "${name}:off"
+      else
+        msg "${YELLOW}${name}: уже выключен.${NC}"
+      fi
+      ;;
+    status)
+      msg "${name}: $([ -f "$flag" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ")"
+      ;;
+    *)
+      msg "${RED}Используйте: on | off | status${NC}"
+      return 1
+      ;;
+  esac
+}
+
+# --------------------------------------------------------
+# handle_compat — применяется ПОСЛЕ перезагрузки (живой by-name не трогаем)
+# --------------------------------------------------------
+handle_compat() {
+  local action="$1"
+  case "$action" in
+    on)
+      if [ -f "$COMPAT_FLAG" ] && [ "$(cat "$COMPAT_FLAG" 2>/dev/null | tr -d ' \t\r\n')" = "on" ]; then
+        msg "${YELLOW}Compat-режим уже включён.${NC}"
+      else
+        echo "on" > "$COMPAT_FLAG"
+        msg "${GREEN}Compat-режим включён. Применится после перезагрузки.${NC}"
+        log_action "compat:on"
+      fi
+      ;;
+    off)
+      if [ -f "$COMPAT_FLAG" ]; then
+        echo "off" > "$COMPAT_FLAG"
+        msg "${GREEN}Compat-режим выключен. Применится после перезагрузки.${NC}"
+        log_action "compat:off"
+      else
+        msg "${YELLOW}Compat-режим уже выключен.${NC}"
+      fi
+      ;;
+    status)
+      local st="ВЫКЛ"
+      [ -f "$COMPAT_FLAG" ] && [ "$(cat "$COMPAT_FLAG" 2>/dev/null | tr -d ' \t\r\n')" = "on" ] && st="${YELLOW}ВКЛ${NC}"
+      msg "Compat-режим: ${st}"
+      ;;
+    *)
+      msg "${RED}Используйте: compatibility-mode on | off | status${NC}"
+      return 1
+      ;;
+  esac
+}
+
+# --------------------------------------------------------
+# handle_stealth — действует сразу (watchdog читает флаг в рантайме)
+# --------------------------------------------------------
+handle_stealth() {
+  toggle_flag_mode "Stealth" "$STEALTH_FLAG" "$1" 1
+}
+
+# --------------------------------------------------------
+# handle_monitor — действует сразу (watchdog читает флаг в рантайме)
+# --------------------------------------------------------
+handle_monitor() {
+  toggle_flag_mode "Monitor" "$MONITOR_FLAG" "$1" 1
+}
+
+show_help() {
+  clear 2>/dev/null || printf "\033[2J\033[H"
+  msg ""
+  msg "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
+  msg "${GREEN}║       BOOT INTEGRITY MASK v3.5 — СПРАВКА                 ║${NC}"
+  msg "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
+  msg ""
+  msg "${CYAN}НАЗНАЧЕНИЕ МОДУЛЯ${NC}"
+  msg "  Скрывает модификации загрузочных разделов (boot, init_boot,"
+  msg "  vbmeta, vendor_boot, recovery, dtbo) от приложений, которые"
+  msg "  читают их через /dev/block/by-name. Подмена работает через"
+  msg "  loop-устройства и tmpfs (или прямые symlink'и в compat-режиме)."
+  msg ""
+  msg "${CYAN}ОСНОВНЫЕ КОМАНДЫ (прямой вызов)${NC}"
+  msg "  ${GREEN}bootmask-ctrl${NC}               — запустить интерактивное меню"
+  msg "  ${GREEN}bootmask-ctrl dashboard${NC}      — сводный статус (дашборд)"
+  msg "  ${GREEN}bootmask-ctrl status${NC}         — подробный статус"
+  msg "  ${GREEN}bootmask-ctrl status --json${NC}  — статус в формате JSON"
+  msg ""
+  msg "${CYAN}УПРАВЛЕНИЕ МОДУЛЕМ${NC}"
+  msg "  ${GREEN}enable${NC}            — включить модуль (требуется перезагрузка)"
+  msg "  ${GREEN}disable${NC}           — отключить модуль (требуется перезагрузка)"
+  msg "  ${GREEN}restore${NC}           — немедленно убрать подмену и отключить модуль"
+  msg "  ${GREEN}restart-watchdog${NC}  — перезапустить фоновый watchdog"
+  msg "  ${GREEN}freeze${NC}            — временно отключить подмену без полного"
+  msg "                         отключения модуля (до разморозки)"
+  msg "  ${GREEN}thaw${NC}              — разморозить модуль и восстановить подмену"
+  msg ""
+  msg "${CYAN}РЕЖИМЫ РАБОТЫ${NC}"
+  msg "  ${GREEN}compatibility-mode on|off|status${NC}"
+  msg "       Включает/выключает режим совместимости (прямые symlink'и"
+  msg "       вместо tmpfs). Используйте, если tmpfs нестабильна."
+  msg "  ${GREEN}stealth on|off|status${NC}"
+  msg "       Включает/выключает скрытный режим (отключает все логи)."
+  msg "  ${GREEN}monitor on|off|status${NC}"
+  msg "       Включает/выключает режим наблюдения (watchdog сообщает"
+  msg "       о нарушениях, но не восстанавливает ссылки)."
+  msg ""
+  msg "${CYAN}ДИАГНОСТИКА И ИНФОРМАЦИЯ${NC}"
+  msg "  ${GREEN}check-integrity${NC}   — проверить, совпадает ли loop-устройство"
+  msg "                         со стоковым образом (MD5/SHA256)"
+  msg "  ${GREEN}image-info${NC}        — показать размер, хеш и заголовок образа"
+  msg "  ${GREEN}logs${NC}              — показать логи модуля из dmesg"
+  msg "  ${GREEN}diag${NC}              — быстрая диагностика системы и модуля"
+  msg "  ${GREEN}analyze${NC}           — полный анализ состояния с рекомендациями"
+  msg "  ${GREEN}report${NC}            — создать подробный отчёт и сохранить"
+  msg "                         в /sdcard/BootMask/reports/"
+  msg "  ${GREEN}diff-report${NC}       — сравнить два последних отчёта"
+  msg ""
+  msg "${CYAN}СИСТЕМА ХУКОВ${NC}"
+  msg "  ${GREEN}hooks list${NC}        — показать все установленные хуки"
+  msg "  ${GREEN}hooks run <событие>${NC} — принудительно запустить хуки"
+  msg "                         для указанного события (для тестирования)"
+  msg ""
+  msg "${CYAN}СОВЕТЫ ПО ИСПОЛЬЗОВАНИЮ${NC}"
+  msg "  • При первом запуске выполните ${GREEN}analyze${NC} — он проверит всё"
+  msg "    и подскажет, что нужно исправить."
+  msg "  • Если после установки модуля пропали другие разделы"
+  msg "    в /dev/block/by-name, включите ${GREEN}compatibility-mode on${NC}."
+  msg "  • Для максимальной скрытности используйте ${GREEN}stealth on${NC}."
+  msg "  • Watchdog настраивается в файле"
+  msg "    ${GREEN}/data/adb/modules/bootmask/common/watchdog.conf${NC}"
+  msg "    (первая строка — интервал в секундах, вторая — 'debug')."
+  msg "  • Все бекапы и отчёты хранятся в ${GREEN}/sdcard/BootMask/${NC}."
+  msg ""
+  msg "${CYAN}ГОРЯЧИЕ КЛАВИШИ В МЕНЮ${NC}"
+  msg "  s,e,d,r,w,l,c,i,g,p,m,f,t,x,o,a,hk,hr,ld — быстрый выбор пунктов"
+  msg "  y/n/s/q — переключение режимов в интерактивных переключателях"
+  msg ""
+}
+
+interactive_menu() {
+  check_deps
+  while true; do
+    show_dashboard
+    msg ""
+    status_line
+    msg ""
+
+    msg "${GREEN}• ИНФОРМАЦИЯ И ДИАГНОСТИКА${NC}"
+    msg "  ${GREEN}1)${NC} status               ${GREEN}2)${NC} logs       ${GREEN}3)${NC} check-integrity"
+    msg "  ${GREEN}4)${NC} image-info           ${GREEN}5)${NC} diag       ${GREEN}6)${NC} analyze"
+    msg ""
+
+    msg "${YELLOW}• УПРАВЛЕНИЕ МОДУЛЕМ${NC}"
+    msg "  ${YELLOW}7)${NC} enable               ${YELLOW}8)${NC} disable    ${RED}9)${NC} restore"
+    msg "  ${YELLOW}10)${NC} restart-watchdog    ${YELLOW}11)${NC} freeze     ${YELLOW}12)${NC} thaw"
+    msg ""
+
+    msg "${CYAN}• РЕЖИМЫ РАБОТЫ${NC}"
+    msg "  ${CYAN}13)${NC} compatibility-mode   ${CYAN}14)${NC} stealth    ${CYAN}15)${NC} monitor"
+    msg ""
+
+    msg "${BLUE}• ОТЧЁТЫ${NC}"
+    msg "  ${BLUE}16)${NC} report               ${BLUE}17)${NC} diff-report"
+    msg ""
+
+    msg "${MAGENTA}• ХУКИ${NC}"
+    msg "  ${MAGENTA}18)${NC} hooks list          ${MAGENTA}19)${NC} hooks run <event>"
+    msg ""
+
+    msg "  ${RED}0)${NC} exit"
+    msg ""
+
+    msg "Горячие клавиши: s,e,d,r,w,l,c,i,g,p,m,f,t,x,o,a,hk,hr,ld  (или номер)"
+    printf "Ваш выбор: "
+    read choice
+    local lower_choice=$(echo "$choice" | tr -d '\n\r' | tr 'A-Z' 'a-z')
+
+    local CMD="" subopt="" subcmd=""
+    case "$lower_choice" in
+      s|1) CMD="status" ;;
+      l|2) CMD="logs" ;;
+      c|3) CMD="check-integrity" ;;
+      i|4) CMD="image-info" ;;
+      g|5) CMD="diag" ;;
+      a|6) CMD="analyze" ;;
+      e|7) CMD="enable" ;;
+      d|8) CMD="disable" ;;
+      r|9) CMD="restore" ;;
+      w|10) CMD="restart-watchdog" ;;
+      f|11) CMD="freeze" ;;
+      t|12) CMD="thaw" ;;
+      m|13) CMD="compatibility-mode"; subopt="" ;;
+      x|14) CMD="stealth"; subopt="" ;;
+      o|15) CMD="monitor"; subopt="" ;;
+      p|16) CMD="report" ;;
+      ld|17) CMD="diff-report" ;;
+      hk|18) CMD="hooks"; subcmd="list" ;;
+      hr|19) CMD="hooks"; subcmd="run"; printf "Введите событие: "; read subopt ;;
+      0|exit)
+        if [ ! -f "$DISABLE_FLAG" ]; then
+          printf "Модуль активен. Выйти? [y/N] "
+          read yn
+          case "$yn" in
+            [Yy]|[Yy][Ee][Ss]) msg "Выход."; exit 0 ;;
+            *) continue ;;
+          esac
+        else
+          msg "Выход."; exit 0
+        fi
+        ;;
+      *) msg "${RED}Неверный выбор${NC}"; sleep 1; continue ;;
+    esac
+
+    case "$CMD" in
+      compatibility-mode|stealth|monitor)
+        local current_state="ВЫКЛ"
+        case "$CMD" in
+          compatibility-mode) [ -f "$COMPAT_FLAG" ] && current_state="ВКЛ" ;;
+          stealth) [ -f "$STEALTH_FLAG" ] && current_state="ВКЛ" ;;
+          monitor) [ -f "$MONITOR_FLAG" ] && current_state="ВКЛ" ;;
+        esac
+        while true; do
+          msg ""
+          msg "Режим: ${CYAN}${CMD}${NC}   (сейчас: $([ "$current_state" = "ВКЛ" ] && echo -e "${YELLOW}ВКЛ${NC}" || echo "ВЫКЛ"))"
+          msg "  [${GREEN}y${NC}] Включить"
+          msg "  [${RED}n${NC}] Выключить"
+          msg "  [${BLUE}s${NC}] Статус"
+          msg "  [${YELLOW}q${NC}] Отмена"
+          printf "Выбор (y/n/s/q): "
+          read subopt
+          local lower_sub=$(echo "$subopt" | tr -d '\n\r' | tr 'A-Z' 'a-z')
+          case "$lower_sub" in
+            y) subopt="on"; break ;;
+            n) subopt="off"; break ;;
+            s) subopt="status"; break ;;
+            q|*) subopt=""; break ;;
+          esac
+        done
+        ;;
+    esac
+
+    if [ -n "$CMD" ]; then
+      msg ""
+      case "$CMD" in
+        status) show_dashboard ;;
+        enable) enable_module ;;
+        disable) disable_module ;;
+        restore) restore_module ;;
+        restart-watchdog) restart_watchdog ;;
+        logs) show_logs ;;
+        check-integrity) check_integrity ;;
+        image-info) image_info ;;
+        diag) show_diag ;;
+        report) generate_report ;;
+        compatibility-mode) [ -n "$subopt" ] && handle_compat "$subopt" ;;
+        freeze) freeze_module ;;
+        thaw) thaw_module ;;
+        stealth) [ -n "$subopt" ] && handle_stealth "$subopt" ;;
+        monitor) [ -n "$subopt" ] && handle_monitor "$subopt" ;;
+        analyze) analyze ;;
+        diff-report) diff_report ;;
+        hooks) 
+          case "$subcmd" in
+            list) show_hooks ;;
+            run) run_hooks_cmd "$subopt" ;;
+          esac
+          ;;
+      esac
+      log_action "menu:$CMD"
+    fi
+    msg ""
+    printf "Нажмите Enter для продолжения..."
+    read dummy
+  done
+}
+
+# --------------------------------------------------------
+# Точка входа
+# --------------------------------------------------------
+if [ $# -ge 1 ]; then
+  check_deps
+  case "$1" in
+    dashboard) show_dashboard ;;
+    status)
+      if [ "$2" = "--json" ]; then
+        show_status_json
+      else
+        show_dashboard
+      fi
+      ;;
+    enable) enable_module ;;
+    disable) disable_module ;;
+    restore) restore_module force ;;
+    restart-watchdog) restart_watchdog ;;
+    logs) show_logs "$2" ;;
+    check-integrity) check_integrity ;;
+    image-info) image_info ;;
+    diag) show_diag ;;
+    report) generate_report ;;
+    diff-report) diff_report ;;
+    compatibility-mode) handle_compat "$2" ;;
+    freeze) freeze_module ;;
+    thaw) thaw_module ;;
+    stealth) handle_stealth "$2" ;;
+    monitor) handle_monitor "$2" ;;
+    analyze)
+      if [ "$2" = "--json" ]; then
+        analyze_json
+      else
+        analyze
+      fi
+      ;;
+    hooks)
+      case "$2" in
+        list) show_hooks ;;
+        run) run_hooks_cmd "$3" ;;
+        *) msg "Используйте: hooks list | hooks run <event>" ;;
+      esac
+      ;;
+    help|--help|-h) show_help ;;
+    *)
+      msg "${RED}Неизвестная команда: $1${NC}"
+      msg "Используйте help для списка команд."
+      exit 1
+      ;;
+  esac
+else
+  interactive_menu
+fi
