@@ -1,338 +1,250 @@
-================================================================
-  Boot Integrity Mask v3.6
-  Автор:    ExchNow (by Lolokeksu)
-  Версия:   v3.6 (09.06.2026)
-  Root:     Magisk 27+ / KernelSU / APatch / Magisk Delta
-  Android:  12-16  |  ARM64  |  A/B и A-only
-================================================================
+# Boot Integrity Mask
 
+![Version](https://img.shields.io/badge/version-v3.6-crimson)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+![Android](https://img.shields.io/badge/android-12--16-brightgreen)
+![Architecture](https://img.shields.io/badge/arch-ARM64-orange)
+![Magisk](https://img.shields.io/badge/Magisk-27%2B-black)
+![KernelSU](https://img.shields.io/badge/KernelSU-supported-green)
+![APatch](https://img.shields.io/badge/APatch-supported-green)
 
-  ЧТО ДЕЛАЕТ МОДУЛЬ
-----------------------------------------------------------------
-  Скрывает модификацию загрузочных разделов (boot, init_boot,
-  vbmeta, vendor_boot, recovery, dtbo) и динамических разделов
-  (super) от приложений, читающих их через /dev/block/by-name.
+Hides modifications to boot partitions (`boot`, `init_boot`, `vbmeta`, `vendor_boot`, `recovery`, `dtbo`) and dynamic partitions (`super`) from applications reading them via `/dev/block/by-name`.
 
-  Подмена включается на раннем этапе загрузки через loop-
-  устройства и tmpfs, и поддерживается адаптивным watchdog'ом
-  всё время работы устройства.
+Substitution is activated at early boot stage via loop devices and tmpfs, and maintained by an adaptive watchdog throughout device operation.
 
-  ! Модуль не скрывает разблокированный загрузчик и не помогает
-    пройти Play Integrity / SafetyNet.
+> **This is the final release. No further updates are planned.**
 
+---
 
-  ТРЕБОВАНИЯ
-----------------------------------------------------------------
-  Android       : 12 - 16
-  Root-менеджер : Magisk 27+, KernelSU, APatch, Magisk Delta
-  Архитектура   : ARM64 (arm64-v8a)
-  Разметка      : A/B и A-only
-  Ядро          : поддержка loop-устройств и tmpfs
-  Обязательно   : stock_boot.img в папке common/ архива
+## Requirements
 
+| Parameter | Value |
+|---|---|
+| Android | 12 – 16 |
+| Root | Magisk 27+, KernelSU, APatch, Magisk Delta |
+| Architecture | ARM64 (arm64-v8a) |
+| Partition layout | A/B and A-only |
+| Kernel | loop devices + tmpfs support |
+| Required | `stock_boot.img` placed in `common/` before install |
 
-  УСТАНОВКА
-----------------------------------------------------------------
-  1. ПОДГОТОВКА ОБРАЗА
+---
 
-     Возьмите стоковый образ (boot.img или init_boot.img) из
-     официальной прошивки вашего устройства. Образ должен
-     соответствовать установленной версии прошивки.
+## Installation
 
-     Переименуйте в stock_boot.img
-     Поддерживается .img.gz — распакуется автоматически.
-     Целевой раздел определяется автоматически по размеру.
+### 1. Prepare stock image
 
-     Опционально — образы дополнительных разделов:
-       stock_vbmeta.img
-       stock_vendor_boot.img
-       stock_recovery.img
-       stock_dtbo.img
+Get `stock_boot.img` (or `init_boot.img`) from the **official firmware** for your device. It must match the currently installed firmware version exactly.
 
-  2. СБОРКА АРХИВА
+Rename it to `stock_boot.img`. Compressed `.img.gz` is supported — extracted automatically.  
+Target partition (`boot` or `init_boot`) is detected automatically by image size.
 
-     - Скачайте BootMask3.5.zip
-     - Откройте ZIP не распаковывая (MT Manager и т.п.)
-     - Перейдите в папку common/
-     - Поместите stock_boot.img и опциональные образы
-     - Для подмены динамических разделов создайте файл
-       .super_targets (по одному разделу на строку):
-         system
-         vendor
-         product
-     - Закройте архив
+Optional — images for additional partitions:
+```
+stock_vbmeta.img
+stock_vendor_boot.img
+stock_recovery.img
+stock_dtbo.img
+```
 
-  3. УСТАНОВКА
+### 2. Build the archive
 
-     Magisk / KernelSU / APatch
-       -> Модули -> Установить из хранилища -> BootMask3.5.zip
-     Дождитесь "Installation complete" и перезагрузите устройство.
+1. Download `BootMask3.6.zip`
+2. Open the ZIP **without extracting** (MT Manager, ZArchiver, etc.)
+3. Navigate to `common/`
+4. Place `stock_boot.img` and optional images there
+5. For dynamic partitions, create `.super_targets` (one partition name per line):
+```
+system
+vendor
+product
+```
+6. Close the archive
 
-  4. ПРОВЕРКА
+### 3. Install
 
-     su -c "/data/adb/modules/bootmask/bootmask-ctrl status"
+Magisk / KernelSU / APatch → **Modules** → **Install from storage** → select archive  
+Wait for `Installation complete` and reboot.
 
-     Если статус АКТИВЕН и указано loop-устройство — работает.
-     Подробная проверка:
-     su -c "/data/adb/modules/bootmask/bootmask-ctrl analyze"
+### 4. Verify
 
+```sh
+su -c "/data/adb/modules/bootmask/bootmask-ctrl status"
+```
 
-  ОСНОВНЫЕ КОМАНДЫ
-----------------------------------------------------------------
-  Все команды: su -c "/data/adb/modules/bootmask/bootmask-ctrl <команда>"
+If status shows **ACTIVE** and a loop device is listed — module is working.  
+Full check:
+```sh
+su -c "/data/adb/modules/bootmask/bootmask-ctrl analyze"
+```
 
-  -- Статус и диагностика --
+---
 
-  status              Сводный дашборд
-  status --json       Статус в формате JSON
-  analyze             Полный анализ с рекомендациями
-  check-integrity     Проверка хеша loop против образа
-  image-info          Размер, SHA256 и magic образов
-  diag                Диагностика системы
-  logs                Журнал событий
-  logs 100            Последние 100 строк журнала
-  report              Полный отчёт -> /sdcard/BootMask/reports/
-  diff-report         Сравнение двух последних отчётов
+## Features
 
-  -- Управление --
+- **Auto-detection** of target partition (`boot` / `init_boot`) by image size
+- **Optional substitution** of `vbmeta`, `vendor_boot`, `recovery`, `dtbo`
+- **Dynamic partitions** (`super`) via `.super_targets`
+- **Compressed images** `.img.gz` supported
+- **Adaptive watchdog** — interval adapts by screen state and battery level
+- **Bootloop protection** — multi-layer verification with automatic compat fallback
+- **OTA safety** — module auto-freezes on update detection, does not interfere with flashing
+- **Safe Boot** — auto-disable if boot not confirmed within 120 seconds
+- **Stealth mode** — disables all logging
+- **Monitor mode** — watchdog observes without restoring
+- **Hook system** — 7 events with environment variables
+- **Interactive control center** `bootmask-ctrl` — diagnostics, reports, mode switching
+- **Cross-platform installer** — Magisk / KernelSU / APatch with SELinux policy on all three
+- **Partition backup** to `/sdcard/BootMask/backups/`
+- **Compatibility mode** for devices with unstable tmpfs
 
-  enable              Включить модуль (+ перезагрузка)
-  disable             Отключить модуль (+ перезагрузка)
-  restore             Убрать подмену и отключить немедленно
-  restart-watchdog    Перезапустить фоновый watchdog
-  freeze              Временно приостановить подмену
-  thaw                Возобновить подмену после freeze
+---
 
-  -- Режимы работы --
+## Commands
 
-  compatibility-mode on|off|status
-  stealth on|off|status
-  monitor on|off|status
+All commands require root. Prefix: `su -c "/data/adb/modules/bootmask/bootmask-ctrl <command>"`
 
-  -- Хуки --
+### Status & Diagnostics
 
-  hooks list              Список установленных хуков
-  hooks run <событие>     Запустить хуки события вручную
+| Command | Description |
+|---|---|
+| `status` | Dashboard: loop, slot, watchdog status |
+| `status --json` | Status in JSON format |
+| `analyze` | Full analysis with recommendations |
+| `check-integrity` | Hash verification of loop vs stock image |
+| `image-info` | Size, SHA256 and magic of stock images |
+| `diag` | System diagnostics: utilities, SELinux, loop, tmpfs |
+| `logs [N]` | Event log (default: last 50 lines) |
+| `report` | Full report → `/sdcard/BootMask/reports/` |
+| `diff-report` | Compare two latest reports |
 
+### Management
 
-  РЕЖИМЫ РАБОТЫ
-----------------------------------------------------------------
-  SAFE BOOT (автоматический)
-    Если система не подтвердит успешную загрузку за 120 секунд,
-    модуль автоматически отключится. При bootloop — просто
-    перезагрузитесь ещё раз, модуль уже будет неактивен.
+| Command | Description |
+|---|---|
+| `enable` | Enable module (+ reboot) |
+| `disable` | Disable module (+ reboot) |
+| `restore` | Remove substitution and disable immediately |
+| `restart-watchdog` | Restart background watchdog |
+| `freeze` | Temporarily suspend substitution |
+| `thaw` | Resume substitution after freeze |
 
-  COMPAT-РЕЖИМ (режим совместимости)
-    Использует прямые symlink'и вместо tmpfs.
-    Включайте если:
-      - В dmesg есть ошибки mount tmpfs
-      - После установки пропадают разделы в /dev/block/by-name
-    Команда: compatibility-mode on
-    ! Требуется перезагрузка после изменения.
+### Modes
 
-  STEALTH-РЕЖИМ
-    Отключает всю запись в dmesg и bootmask.log.
-    Устраняет следы работы в системных логах.
-    Команда: stealth on
-    Действует немедленно, без перезагрузки.
+| Command | Description |
+|---|---|
+| `compatibility-mode on\|off\|status` | symlinks instead of tmpfs |
+| `stealth on\|off\|status` | disable all logging |
+| `monitor on\|off\|status` | observe without restoring |
 
-  MONITOR-РЕЖИМ
-    Watchdog обнаруживает нарушения ссылок и логирует их,
-    но НЕ восстанавливает. Полезно для диагностики.
-    Команда: monitor on
-    Действует немедленно, без перезагрузки.
+---
 
-  FREEZE / THAW
-    freeze — временно отключить подмену без деактивации модуля.
-    thaw   — возобновить подмену.
-    Не требует перезагрузки.
+## Hook System
 
+Place executable scripts (`chmod 755`) into event directories:
 
-  КОНФИГУРАЦИЯ WATCHDOG
-----------------------------------------------------------------
-  Файл: /data/adb/modules/bootmask/common/watchdog.conf
+```
+/data/adb/modules/bootmask/common/hooks/<event>/your_script.sh
+```
 
-  Строка 1: интервал проверки в секундах (минимум 10, по умол. 120)
-  Строка 2: debug — подробное логирование всех событий
+### Events
 
-  Пример watchdog.conf:
-    120
-    debug
+| Event | Trigger |
+|---|---|
+| `pre-activate` | Before substitution (early boot) |
+| `post-activate` | After successful activation |
+| `pre-deactivate` | Before disable / restore / freeze |
+| `post-deactivate` | After deactivation |
+| `on-link-broken` | Watchdog detected broken symlink |
+| `on-link-restored` | Watchdog restored symlink |
+| `on-ota-detected` | System update detected |
 
-  Адаптация интервала:
-    Экран выключен          -> интервал x2
-    Заряд батареи <= 20%    -> интервал x2
-    Оба условия             -> интервал x4
-    Максимум                -> 600 секунд
+### Environment variables
 
+```sh
+HOOK_EVENT      # event name
+HOOK_TARGET     # target partition: boot or init_boot
+HOOK_LOOP       # loop device path: /dev/block/loop42
+HOOK_LINK       # symlink path (on-link-broken/restored only)
+HOOK_TIMESTAMP  # Unix timestamp
+```
 
-  СИСТЕМА ХУКОВ
-----------------------------------------------------------------
-  Хуки — ваши скрипты, которые модуль запускает автоматически
-  при ключевых событиях.
+### Example
 
-  Расположение:
-    /data/adb/modules/bootmask/common/hooks/<событие>/скрипт.sh
+```sh
+#!/system/bin/sh
+echo "[$(date)] $HOOK_EVENT | $HOOK_TARGET | $HOOK_LOOP" \
+  >> /sdcard/BootMask/hooks.log
+```
 
-  Поддерживаемые события:
-    pre-activate      До активации подмены (ранняя загрузка)
-    post-activate     После успешной активации
-    pre-deactivate    Перед отключением (disable/restore/freeze)
-    post-deactivate   После отключения
-    on-link-broken    Watchdog обнаружил повреждённую ссылку
-    on-link-restored  Watchdog восстановил ссылку
-    on-ota-detected   Обнаружено системное обновление
+---
 
-  Переменные окружения в скрипте:
-    HOOK_EVENT        имя события
-    HOOK_TARGET       целевой раздел (boot / init_boot)
-    HOOK_LOOP         путь к loop-устройству
-    HOOK_LINK         путь к симлинку (on-link-broken/restored)
-    HOOK_TIMESTAMP    время события (Unix timestamp)
+## Watchdog Configuration
 
-  Правила:
-    - Первая строка: #!/system/bin/sh
-    - Права: 755 (rwxr-xr-x)
-    - Таймаут: 30 секунд
-    - Выполняются асинхронно, не блокируют загрузку
-    - В pre-activate избегайте тяжёлых операций
-      (/data может быть ещё недоступен)
+File: `/data/adb/modules/bootmask/common/watchdog.conf`
 
-  Пример — лог активации:
-    #!/system/bin/sh
-    LOG="/sdcard/BootMask/activation.log"
-    mkdir -p "$(dirname "$LOG")"
-    echo "$(date) | $HOOK_EVENT | $HOOK_TARGET | $HOOK_LOOP" >> "$LOG"
+```
+120
+debug
+```
 
-  Пример — резервная копия при OTA:
-    #!/system/bin/sh
-    BACKUP="/sdcard/BootMask/ota_backup"
-    mkdir -p "$BACKUP"
-    cp /data/adb/modules/bootmask/common/stock_boot.img \
-       "$BACKUP/stock_boot_$(date +%Y%m%d_%H%M%S).img"
+| Line | Value |
+|---|---|
+| 1 | Base check interval in seconds (min 10, default 120) |
+| 2 | `debug` — verbose logging to `bootmask.log` |
 
+Interval adapts automatically:
+- Screen off → ×2
+- Battery ≤ 20% → ×2
+- Both → ×4
+- Maximum: 600 seconds
 
-  СТРУКТУРА ФАЙЛОВ МОДУЛЯ
-----------------------------------------------------------------
-  /data/adb/modules/bootmask/
-  |
-  +-- module.prop              метаданные модуля
-  +-- post-fs-data.sh          ранняя активация
-  +-- service.sh               фоновый watchdog
-  +-- bootmask-ctrl            центр управления
-  +-- customize.sh             установщик
-  +-- disable                  флаг отключения (если есть)
-  |
-  +-- common/
-  |   +-- stock_boot.img       стоковый образ (обязательно)
-  |   +-- stock_vbmeta.img     опционально
-  |   +-- stock_vendor_boot.img
-  |   +-- stock_recovery.img
-  |   +-- stock_dtbo.img
-  |   +-- compat_mode          флаг compat-режима
-  |   +-- watchdog.conf        конфигурация watchdog
-  |   +-- hooks/
-  |       +-- pre-activate/
-  |       +-- post-activate/
-  |       +-- pre-deactivate/
-  |       +-- post-deactivate/
-  |       +-- on-link-broken/
-  |       +-- on-link-restored/
-  |       +-- on-ota-detected/
-  |
-  +-- .active_loop             путь к активному loop (boot)
-  +-- .target_part             целевой раздел (boot/init_boot)
-  +-- .stock_size              размер стокового образа
-  +-- .stock_checksum          SHA256 стокового образа
-  +-- .byname_dir              путь к by-name каталогу
-  +-- .watchdog_pid            PID фонового watchdog
-  +-- .restore_count           счётчик восстановлений
-  +-- .loop_error_count        счётчик ошибок loop
-  +-- .frozen                  флаг заморозки
-  +-- .stealth                 флаг stealth-режима
-  +-- .monitor                 флаг monitor-режима
-  +-- .safe_boot_ok / .safe_boot_failed
-  |
-  +-- bootmask.log             журнал событий watchdog
-  +-- ctrl.log                 журнал команд bootmask-ctrl
+---
 
-  Отчёты и бэкапы: /sdcard/BootMask/
+## Troubleshooting
 
+**Module not activated**
+```sh
+su -c "/data/adb/modules/bootmask/bootmask-ctrl analyze"
+```
+Check that `stock_boot.img` size matches the partition and corresponds to current firmware.
 
-  УСТРАНЕНИЕ НЕПОЛАДОК
-----------------------------------------------------------------
-  Модуль не активировался
-    -> Проверьте размер образа:
-       bootmask-ctrl analyze
-    -> Убедитесь что stock_boot.img соответствует прошивке
-    -> Проверьте журнал:
-       bootmask-ctrl logs
+**Bootloop after install**
+Reboot once more — Safe Boot will have disabled the module automatically.
 
-  Bootloop после установки
-    -> Просто перезагрузитесь ещё раз (Safe Boot отключит модуль)
-    -> Проверьте соответствие образа прошивке
+**Partitions disappear from `/dev/block/by-name`**
+```sh
+su -c "/data/adb/modules/bootmask/bootmask-ctrl compatibility-mode on"
+```
+Then reboot.
 
-  Пропадают разделы в /dev/block/by-name
-    -> Включите compat-режим:
-       bootmask-ctrl compatibility-mode on
-    -> Перезагрузите устройство
+**Module frozen after OTA**
+Expected behavior. Prepare new `stock_boot.img` for the new firmware version, replace it in `common/` and reinstall the module.
 
-  После OTA модуль заморожен
-    -> Это штатное поведение
-    -> Подготовьте новый stock_boot.img от новой прошивки
-    -> Замените образ в common/ архива
-    -> Переустановите модуль
+**dmesg is empty**
+Android 12+ restricts `dmesg` access (`dmesg_restrict`). Use the module log instead:
+```sh
+su -c "/data/adb/modules/bootmask/bootmask-ctrl logs"
+```
 
-  Логи пусты (dmesg недоступен)
-    -> На Android 12+ dmesg ограничен ядром (dmesg_restrict)
-    -> Используйте журнал модуля:
-       bootmask-ctrl logs
+---
 
-  Хук не выполняется
-    -> Проверьте права: должно быть 755
-    -> Первая строка: #!/system/bin/sh
-    -> Имя папки через дефис: pre-activate, не pre_activate
-    -> Тест вручную:
-       su -c "sh /data/adb/modules/bootmask/common/hooks/post-activate/скрипт.sh"
+## Changelog
 
+### v3.6 — Final Release
+- Detailed compat fallback logging: shows exact symlink that failed verification
+- `analyze` checks firmware fingerprint match against image installed with
+- `check-integrity` caches image hash by mtime — no rehashing if unchanged
+- Fixed watchdog interval display with non-numeric `watchdog.conf` value
+- Added `README.md` to module archive
 
-  CHANGELOG
-----------------------------------------------------------------
-  v3.6 (09.06.2026) — финальная версия
-    + Детальное логирование причины отката в compat-режим:
-      теперь видно какая именно ссылка не прошла верификацию
-    + analyze проверяет соответствие stock_boot.img текущей
-      прошивке (сравнение fingerprint при установке и сейчас)
-    + check-integrity: кэш хеша образа по mtime — повторный
-      запрос не читает файл заново если образ не менялся
-    + Исправлено отображение интервала watchdog в дашборде
-      при нестандартном значении watchdog.conf
-    + Добавлен README.md в архив модуля
+---
 
-  v3.5 (08.06.2026)
-    + Исправлен критический баг tmpfs-пути: бэкап ссылок теперь
-      хранится вне by-name и не скрывается при монтировании
-    + Защита от bootloop: верификация подмены до передачи
-      управления системе с автооткатом в compat при сбое
-    + Исправлен сбой активации на mksh/ash
-    + Восстановлены команды: check-integrity, image-info, logs,
-      diag, restart-watchdog, stealth, monitor, compatibility-mode
-    + Watchdog отслеживает все подменяемые разделы (не только boot)
-    + SELinux-политика применяется на Magisk, KernelSU и APatch
-    + Исправлена система хуков (pre/post-activate)
-    + Прямая проверка ссылок вместо хеша каталога
-    + Меню перенумеровано по порядку (1-19)
-    + JSON-вывод: добавлено булево поле disabled
+## Discussion
 
-  v3.0
-    + Адаптивный watchdog с backoff-алгоритмом
-    + Поддержка динамических разделов (super)
-    + Система хуков (7 событий)
-    + Safe Boot, Stealth-режим, Monitor-режим
-    + Интерактивный центр управления bootmask-ctrl
-    + Кроссплатформенный установщик
+- **4PDA:** [Boot Integrity Mask](https://4pda.to/forum/index.php?showtopic=915158&view=findpost&p=143605196)
 
+---
 
-================================================================
-  ExchNow (by Lolokeksu)  |  Boot Integrity Mask v3.6
-================================================================
+## License
+
+[GNU General Public License v3.0](LICENSE)
